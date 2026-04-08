@@ -3,9 +3,9 @@ import Dashboard from './components/Dashboard';
 import './App.css';
 
 /**
- * Main App Component
+ * App Component
  * 
- * Entry point for MoneyTree application
+ * Main entry point for MoneyTree frontend
  */
 
 function App() {

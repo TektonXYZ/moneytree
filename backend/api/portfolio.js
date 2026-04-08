@@ -1,115 +1,177 @@
-const fs = require('fs');
+const express = require('express');
+const fs = require('fs').promises;
 const path = require('path');
 
 /**
  * Portfolio API Route
  * 
- * Manages user portfolios (JSON file-based for demo)
- * - GET /api/portfolio - Get portfolio
+ * Manages user portfolios:
+ * - GET /api/portfolio - Get current portfolio
  * - POST /api/portfolio/buy - Buy stock
  * - POST /api/portfolio/sell - Sell stock
- * - POST /api/portfolio/reset - Reset to starting cash
+ * - GET /api/portfolio/history - Trade history
  * 
- * TODO: Replace with SQLite for production
+ * Uses JSON file storage (demo) - upgrade to SQLite for production
  */
 
-const DATA_FILE = path.join(__dirname, '../data/portfolio.json');
+const router = express.Router();
+const DB_PATH = path.join(__dirname, '../../data/portfolio.json');
+
+// Initialize with default portfolio
+const defaultPortfolio = {
+  userId: 'default',
+  cash: 10000,
+  positions: [],
+  trades: [],
+  createdAt: new Date().toISOString()
+};
 
 // Ensure data directory exists
-const dataDir = path.dirname(DATA_FILE);
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
-
-// Initialize with default portfolio if not exists
-const getPortfolio = () => {
-  if (!fs.existsSync(DATA_FILE)) {
-    const defaultPortfolio = {
-      cash: 10000,
-      startValue: 10000,
-      positions: [],
-      trades: [],
-      createdAt: new Date().toISOString()
-    };
-    fs.writeFileSync(DATA_FILE, JSON.stringify(defaultPortfolio, null, 2));
-    return defaultPortfolio;
-  }
-  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-};
-
-const savePortfolio = (portfolio) => {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(portfolio, null, 2));
-};
-
-module.exports = async (req, res) => {
-  // Enable CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
+const ensureDataDir = async () => {
+  const dataDir = path.dirname(DB_PATH);
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const pathParts = url.pathname.split('/');
-    const action = pathParts[pathParts.length - 1];
-
-    // GET /api/portfolio - Get current portfolio
-    if (req.method === 'GET' && action === 'portfolio') {
-      const portfolio = getPortfolio();
-      
-      // Calculate current value
-      const positionsValue = portfolio.positions.reduce(
-        (sum, pos) => sum + (pos.shares * pos.currentPrice), 
-        0
-      );
-      
-      res.status(200).json({
-        ...portfolio,
-        positionsValue,
-        totalValue: portfolio.cash + positionsValue,
-        totalReturn: ((portfolio.cash + positionsValue - portfolio.startValue) / portfolio.startValue) * 100
-      });
-      return;
-    }
-
-    // POST /api/portfolio/buy
-    if (req.method === 'POST' && action === 'buy') {
-      // TODO: Implement buy logic
-      res.status(501).json({ message: 'Buy endpoint - implement me!' });
-      return;
-    }
-
-    // POST /api/portfolio/sell
-    if (req.method === 'POST' && action === 'sell') {
-      // TODO: Implement sell logic
-      res.status(501).json({ message: 'Sell endpoint - implement me!' });
-      return;
-    }
-
-    // POST /api/portfolio/reset
-    if (req.method === 'POST' && action === 'reset') {
-      const freshPortfolio = {
-        cash: 10000,
-        startValue: 10000,
-        positions: [],
-        trades: [],
-        resetAt: new Date().toISOString()
-      };
-      savePortfolio(freshPortfolio);
-      res.status(200).json({ message: 'Portfolio reset', portfolio: freshPortfolio });
-      return;
-    }
-
-    res.status(404).json({ error: 'Unknown endpoint' });
-
-  } catch (error) {
-    console.error('Portfolio API error:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
-    });
+    await fs.mkdir(dataDir, { recursive: true });
+  } catch (err) {
+    // Directory exists
   }
 };
+
+// Load portfolio from file
+const loadPortfolio = async () => {
+  try {
+    await ensureDataDir();
+    const data = await fs.readFile(DB_PATH, 'utf8');
+    return JSON.parse(data);
+  } catch (err) {
+    // Return default if file doesn't exist
+    return { ...defaultPortfolio };
+  }
+};
+
+// Save portfolio to file
+const savePortfolio = async (portfolio) => {
+  await ensureDataDir();
+  await fs.writeFile(DB_PATH, JSON.stringify(portfolio, null, 2));
+};
+
+// Get current portfolio
+router.get('/', async (req, res) => {
+  try {
+    const portfolio = await loadPortfolio();
+    
+    // Calculate total value
+    const positionsValue = portfolio.positions.reduce(
+      (sum, pos) => sum + (pos.shares * pos.currentPrice), 
+      0
+    );
+    
+    res.json({
+      ...portfolio,
+      totalValue: portfolio.cash + positionsValue,
+      positionsValue
+    });
+  } catch (error) {
+    console.error('Error loading portfolio:', error);
+    res.status(500).json({ error: 'Failed to load portfolio' });
+  }
+});
+
+// Buy stock
+router.post('/buy', async (req, res) => {
+  try {
+    const { symbol, shares, price } = req.body;
+    const portfolio = await loadPortfolio();
+    
+    const totalCost = shares * price;
+    
+    if (portfolio.cash < totalCost) {
+      return res.status(400).json({ error: 'Insufficient funds' });
+    }
+    
+    // Update cash
+    portfolio.cash -= totalCost;
+    
+    // Add/update position
+    const existingPosition = portfolio.positions.find(p => p.symbol === symbol);
+    if (existingPosition) {
+      // Average down/up
+      const totalShares = existingPosition.shares + shares;
+      const totalCostBasis = (existingPosition.shares * existingPosition.avgPrice) + totalCost;
+      existingPosition.shares = totalShares;
+      existingPosition.avgPrice = totalCostBasis / totalShares;
+    } else {
+      portfolio.positions.push({
+        symbol,
+        shares,
+        avgPrice: price,
+        currentPrice: price
+      });
+    }
+    
+    // Record trade
+    portfolio.trades.push({
+      type: 'BUY',
+      symbol,
+      shares,
+      price,
+      total: totalCost,
+      timestamp: new Date().toISOString()
+    });
+    
+    await savePortfolio(portfolio);
+    res.json({ success: true, portfolio });
+  } catch (error) {
+    console.error('Error buying stock:', error);
+    res.status(500).json({ error: 'Failed to buy stock' });
+  }
+});
+
+// Sell stock
+router.post('/sell', async (req, res) => {
+  try {
+    const { symbol, shares, price } = req.body;
+    const portfolio = await loadPortfolio();
+    
+    const position = portfolio.positions.find(p => p.symbol === symbol);
+    if (!position || position.shares < shares) {
+      return res.status(400).json({ error: 'Insufficient shares' });
+    }
+    
+    const totalValue = shares * price;
+    portfolio.cash += totalValue;
+    
+    // Update position
+    position.shares -= shares;
+    if (position.shares === 0) {
+      portfolio.positions = portfolio.positions.filter(p => p.symbol !== symbol);
+    }
+    
+    // Record trade
+    portfolio.trades.push({
+      type: 'SELL',
+      symbol,
+      shares,
+      price,
+      total: totalValue,
+      timestamp: new Date().toISOString()
+    });
+    
+    await savePortfolio(portfolio);
+    res.json({ success: true, portfolio });
+  } catch (error) {
+    console.error('Error selling stock:', error);
+    res.status(500).json({ error: 'Failed to sell stock' });
+  }
+});
+
+// Get trade history
+router.get('/history', async (req, res) => {
+  try {
+    const portfolio = await loadPortfolio();
+    res.json(portfolio.trades || []);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to load history' });
+  }
+});
+
+module.exports = router;
